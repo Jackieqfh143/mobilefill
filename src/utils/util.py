@@ -81,5 +81,4 @@ def files_copy(src, dst):
 
 
 if __name__ == '__main__':
-    img_name = "test.jpg"
-    get_file_info(img_name)
+    backup_src_code(src="/home/codeoops/CV/MobileFill", dst='/home/codeoops/CV/MobileFill')

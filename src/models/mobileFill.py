@@ -1,10 +1,10 @@
 import math
 
 from src.models.generator import MobileSynthesisNetwork,MobileSynthesisNetwork_v2,\
-    MobileSynthesisNetwork_v3,MobileSynthesisNetwork_v4,MobileSynthesisNetwork_v5
+    MobileSynthesisNetwork_v3,MobileSynthesisNetwork_v4,MobileSynthesisNetwork_v5, MobileSynthesisNetwork_v6
 from src.models.mapping_network import MappingNetwork
 from src.models.encoder import EESPNet,LFFC_encoder,EESPNet_v10,EESPNet_v11,EESPNet_v12,EESPNet_v13,\
-    EESPNet_v14,EESPNet_v15,EESPNet_v16,EESPNet_v17,EESPNet_v18,EESPNet_v19,EESPNet_v20,EESPNet_v21
+    EESPNet_v14,EESPNet_v15,EESPNet_v16,EESPNet_v17,EESPNet_v18,EESPNet_v19,EESPNet_v20,EESPNet_v21,EESPNet_v22
 from src.models.styleMapping import StyleEncoder,StyleEncoder_v2,StyleEncoder_v3,StyleEncoder_v4,\
     StyleEncoder_v5,StyleEncoder_v6
 from src.modules.legacy import EqualLinear
@@ -40,36 +40,37 @@ channels_config = {512: {
 class MobileFill(nn.Module):
     def __init__(self,device= 'cuda',target_size=512, input_nc=4,down_num = 4, latent_nc=512,mlp_layers=8):
         super(MobileFill, self).__init__()
-        self.channels = {
-            4: 256,
-            8: 512,
-            16: 512,
-            32: 512,
-            64: 256,
-            128: 128,
-            256: 64,
-            512: 64,
-        }
+        # self.channels = {
+        #     4: 256,
+        #     8: 512,
+        #     16: 512,
+        #     32: 512,
+        #     64: 256,
+        #     128: 128,
+        #     256: 64,
+        #     512: 64,
+        # }
 
-        down_num = 4 if target_size == 256 else 5
-        en_channels = [v for k, v in self.channels.items() if k < target_size][::-1]
-        gen_channels = [v for k,v in self.channels.items() if k >= (target_size // 2**down_num) and (k <= target_size //2)]
+        # down_num = 4 if target_size == 256 else 5
+        # en_channels = [v for k, v in self.channels.items() if k < target_size][::-1]
+        # gen_channels = [v for k,v in self.channels.items() if k >= (target_size // 2**down_num) and (k <= target_size //2)]
+
+        en_channels = [128, 256, 256, 512]
+        gen_channels = [512, 256, 256, 128]
         # gen_channels = [v for k, v in self.channels.items() if k < target_size]
         self.device = device
-        # self.encoder = EESPNet_v2(input_nc=input_nc,output_nc=latent_nc, input_size=target_size).to(device)
-        self.encoder = EESPNet_v19(config=en_channels, input_nc=input_nc, output_nc=latent_nc, input_size=target_size,
-                                   down_num=down_num)
-        # self.encoder = EESPNet_v21(config=en_channels, input_nc=input_nc, output_nc=latent_nc, input_size=target_size, down_num=down_num).to(device)
+        # self.encoder = EESPNet_v2(input_nc=input_nc,output_nc=latent_nc , input_size=target_size).to(device)
+        self.encoder = EESPNet_v22(config=en_channels, input_nc=input_nc, output_nc=latent_nc, input_size=target_size, down_num=down_num).to(device)
         # self.encoder = LFFC_encoder(input_nc=input_nc,latent_nc=latent_nc,ngf=64,n_downsampling=4,n_blocks=4).to(device)
         # self.encoder = mobilevit_xs(num_classes=latent_nc).to(device)
-        self.mapping_net = MappingNetwork(style_dim=latent_nc,n_layers=mlp_layers)
+        self.mapping_net = MappingNetwork(style_dim=latent_nc,n_layers=mlp_layers).to(device)
         # self.generator = StyleEncoder_v6(channels= gen_channels, latent_nc = latent_nc, device=device).to(device)
-        self.generator = MobileSynthesisNetwork_v5(style_dim=latent_nc,channels=gen_channels,device=device)
+        self.generator = MobileSynthesisNetwork_v6(style_dim=latent_nc,channels=gen_channels,device=device).to(device)
         # self.co_mod_layer = nn.Linear(in_features=2 * latent_nc, out_features= latent_nc).to(self.device)
         self.latent_nc = latent_nc
         self.latent_num = self.generator.wsize()
-        self.dwt = DWTForward(J=1, mode='zero', wave='db1')
-        self.idwt = DWTInverse(mode="zero", wave="db1")
+        self.dwt = DWTForward(J=1, mode='zero', wave='db1').to(self.device)
+        self.idwt = DWTInverse(mode="zero", wave="db1").to(self.device)
 
 
     def preprocess(self,imgs,masks):
@@ -124,8 +125,19 @@ class MobileFill(nn.Module):
 
         return style1 + diff * random.randint(0, n_images)
 
+    def latent_augmented_sampling(self, batch_size, radius = 0.001, num_negative = 10):
+        query = self.make_style(batch_size)
+        pos = torch.FloatTensor(query.shape).uniform_(-radius,radius).add_(query)
+        negs = []
+        for k in range(num_negative):
+            neg = self.make_style(batch_size)
+            while (neg-query).abs().min() < self.opt.radius:
+                neg = self.make_style(batch_size)
+            negs.append(neg)
+        return query, pos, negs
+
     def make_style(self,batch_size):
-        noise = torch.randn(batch_size, self.latent_nc,device = self.device)
+        noise = torch.randn(batch_size, self.latent_nc).to(self.device)
         style = self.mapping_net(noise)
         return style
 

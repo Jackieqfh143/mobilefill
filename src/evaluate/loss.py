@@ -7,6 +7,7 @@ from src.models import resnet
 import contextlib
 weight_gradients_disabled = False
 
+
 def d_logistic_loss(real_pred, fake_pred):
     real_loss = F.softplus(-real_pred)
     fake_loss = F.softplus(fake_pred)

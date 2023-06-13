@@ -1,25 +1,23 @@
 import os
 import shutil
 import torch
-import torch.nn as nn
 from src.models.baseModel import BaseModel
-from src.evaluate.loss import ResNetPL,l1_loss,Gen_loss,Dis_loss
+from src.evaluate.loss import ResNetPL,l1_loss,Dis_loss_mask,Gen_loss,Dis_loss
 from src.utils.util import checkDir,tensor2cv
 import torchvision.utils as vutils
 from tensorboardX import SummaryWriter
 from PIL import Image
 from torch_ema import ExponentialMovingAverage
-from pytorch_wavelets import DWTInverse, DWTForward
-from src.models.mobileFill import MobileFill,MobileFill_v2
-from src.models.discriminator import MultidilatedNLayerDiscriminatorWithAtt, MultidilatedNLayerDiscriminatorWithAtt_v2,\
-    MultidilatedNLayerDiscriminatorWithAtt_UNet,UNetDiscriminator,StyleGAN_Discriminator,EESPDiscriminator
-from src.models.stylegan import StyleGANModel
+from src.models.main import  MobileFill_v3
+from src.models.discriminator import MultidilatedNLayerDiscriminatorWithAtt
 from collections import OrderedDict
+from src.models.stylegan import StyleGANModel
+import kornia
 
 
-class GAN_trainer(BaseModel):
+class EncoderTrainer(BaseModel):
     def __init__(self,opt):
-        super(GAN_trainer, self).__init__(opt)
+        super(EncoderTrainer, self).__init__(opt)
         self.count = 0
         self.opt = opt
         self.mode = opt.mode
@@ -31,38 +29,39 @@ class GAN_trainer(BaseModel):
         self.current_lr = opt.lr
         self.current_d_lr = opt.d_lr
 
-        if self.mode == 1:
-            teacher_state_dict = torch.load(opt.teacher_path)["g_ema"]
-            mapping_state_dict = OrderedDict({k.replace("style", "layers"): v for k, v in teacher_state_dict.items() if k.startswith("style")})
-            self.G_Net = MobileFill(input_nc=4,device=self.device,target_size=opt.targetSize)
-            self.G_Net.mapping_net.load_state_dict(mapping_state_dict)
-            self.G_Net.mapping_net.eval().requires_grad_(False)
-            self.G_Net = self.G_Net.to(self.device)
-            self.D_Net = MultidilatedNLayerDiscriminatorWithAtt(input_nc=3)
-            # self.D_Net = StyleGAN_Discriminator(size=opt.targetSize,channels_in=3)
+        self.G_Net = MobileFill_v3(input_nc=4,device=self.device,target_size=opt.targetSize)
+        self.G_Net.eval().requires_grad_(False)
+        self.D_Net = MultidilatedNLayerDiscriminatorWithAtt(input_nc=3)
+        self.G_opt = torch.optim.AdamW(self.G_Net.parameters(), opt.lr,
+                                       betas=(opt.beta_g_min, opt.beta_g_max))
+        self.D_opt = torch.optim.AdamW(self.D_Net.parameters(), lr=opt.d_lr,
+                                       betas=(opt.beta_d_min, opt.beta_d_max))
 
-            self.G_opt = torch.optim.AdamW(self.G_Net.parameters(), opt.lr,
-                                           betas=(opt.beta_g_min, opt.beta_g_max))
-            self.D_opt = torch.optim.AdamW(self.D_Net.parameters(), lr=opt.d_lr,
-                                           betas=(opt.beta_d_min, opt.beta_d_max))
-
-            if opt.restore_training:
-                self.load()
-
-            if self.opt.enable_ema:
-                self.ema_G = ExponentialMovingAverage(self.G_Net.parameters(), decay=0.995)
-                self.ema_G.to(self.device)
-                self.acc_args = [self.G_Net, self.D_Net, self.G_opt, self.D_opt]
-            else:
-                #args that should be prepared for accelerator
-                self.acc_args = [self.G_Net, self.D_Net,self.G_opt, self.D_opt]
+        self.G_Net.encoder.load_state_dict(torch.load(self.opt.model_path))
 
 
-            if opt.enable_teacher:
-                self.teacher = StyleGANModel(model_path=opt.teacher_path,device=self.device,targetSize=self.opt.targetSize)
+        if opt.restore_training:
+            self.load()
 
-        self.dwt = DWTForward(J=1, mode='zero', wave='db1').to(self.device)
-        self.idwt = DWTInverse(mode="zero", wave="db1").to(self.device)
+        if self.opt.enable_ema:
+            self.ema_G = ExponentialMovingAverage(self.G_Net.parameters(), decay=0.995)
+            self.ema_G.to(self.device)
+
+
+        #args that should be prepared for accelerator
+        self.acc_args = [self.G_Net, self.D_Net,self.G_opt, self.D_opt]
+
+
+        self.teacher = StyleGANModel(model_path=opt.teacher_path, targetSize=opt.targetSize,device=self.device)
+
+        self.img_aug = torch.nn.Sequential(
+                            kornia.augmentation.RandomHorizontalFlip(),
+                            kornia.augmentation.RandomAffine(
+                                translate=(0.1, 0.3),
+                                scale=(0.7, 1.2),
+                                degrees=(-20, 20)
+                            ),
+                        )
 
         self.lossDict = {}
         self.print_loss_dict = {}
@@ -70,46 +69,75 @@ class GAN_trainer(BaseModel):
         self.val_im_dict = {}
 
     def train(self):
-        self.G_Net.generator.train()
-        self.G_Net.encoder.train()
-        self.D_Net.train()
+        if self.mode == 1:
+            self.G_Net.encoder.train()
+
+        elif self.mode == 2:
+            self.G_Net.generator.train()
+
+        else:
+            self.G_Net.refine_encoder.train()
+            self.G_Net.refine_decoder.train()
 
     def eval(self):
         self.G_Net.eval()
 
-    def make_sample(self,sample_z):
-        samples = self.teacher.sample_with_latent(sample_z)
+
+    def set_input(self,real_imgs,masks):
+        self.mask = masks[:, 2:3, :, :]
+        # self.real_imgs = self.preprocess(real_imgs) #scale to -1 ~ 1
+        masked_im = real_imgs * self.mask  # 0 for holes
+        self.input = torch.cat((masked_im,self.mask),dim=1)
+
+
+    def make_sample(self,latents):
+        samples = self.teacher.sample_with_latent(latents)
         return samples
+
+    """
+    mode1: train the latent encoder 
+    mode2: train the generator
+    mode3: train the refiner
+    """
 
     def forward(self,batch,count):
         self.count = count
-        self.real_imgs, latents = self.make_sample(batch)
-        self.fake_imgs = self.forward_G(batch)
+        masks, noise = batch
+        self.mask = masks[:, 2:3, :, :]
+        true_latent = self.teacher.model.get_latent(noise)
+        true_latents = true_latent.unsqueeze(1).repeat(1, self.G_Net.latent_num, 1)
+        with torch.no_grad():
+            self.real_imgs = self.img_aug(self.make_sample(latents = true_latents))
 
-    def forward_G(self,noise,style = None):
-        return self.G_Net.gan_forward(noise,style)
+        fake_latents, self.deltas, _ = self.G_Net.get_latent(self.real_imgs,masks,noise)
+        gan_fake_imgs = self.make_sample(latents=fake_latents)
+        if self.mode == 1:
+            self.fake_imgs = gan_fake_imgs
+        elif self.mode == 2:
+            self.fake_imgs = self.G_Net.generator(fake_latents)
+        else:
+            merged_x = self.real_imgs * self.mask + gan_fake_imgs * (1 - self.mask)
+            self.fake_imgs = self.G_Net.refine(merged_x)
+
 
     def backward_G(self):
         g_loss_list = []
         g_loss_name_list = []
 
         if self.opt.use_rec_loss:
-            rec_loss = self.opt.lambda_valid * l1_loss(self.real_imgs,self.fake_imgs)
+            if self.mode == 3:
+                # keep background unchanged
+                rec_loss = self.opt.lambda_valid * l1_loss(self.real_imgs,self.fake_imgs,self.mask)
+            else:
+                rec_loss = self.opt.lambda_valid * l1_loss(self.real_imgs, self.fake_imgs)
+
             g_loss_list.append(rec_loss)
             g_loss_name_list.append("rec_loss")
 
-        if self.opt.use_rec_freq_loss:
-            # frequentcy reconstruct loss
-            fake_freq = self.img_to_dwt(self.fake_imgs)
-            real_freq = self.img_to_dwt(self.real_imgs)
-            rec_freq_loss = self.opt.lambda_hole * l1_loss(real_freq, fake_freq)
-            g_loss_list.append(rec_freq_loss)
-            g_loss_name_list.append("rec_freq_loss")
-
         if self.opt.use_gan_loss:
+            #adversarial loss & feature matching loss with gradient penalty
             dis_fake, fake_d_feats = self.D_Net(self.fake_imgs)
-            gen_loss = Gen_loss(dis_fake, type=self.opt.gan_loss_type)
-            gen_loss = self.opt.lambda_gen * gen_loss
+            gen_loss = self.opt.lambda_gen * Gen_loss(dis_fake, type=self.opt.gan_loss_type)
             g_loss_list.append(gen_loss)
             g_loss_name_list.append("gen_loss")
 
@@ -118,6 +146,12 @@ class GAN_trainer(BaseModel):
             perc_loss = self.opt.lambda_perc * perc_loss
             g_loss_list.append(perc_loss)
             g_loss_name_list.append("perc_loss")
+
+        if self.opt.use_delta_loss and self.mode != 3:
+            delta_loss = self.opt.lambda_delta * torch.norm(self.deltas, 2, dim=1).mean()
+            g_loss_list.append(delta_loss)
+            g_loss_name_list.append("delta_loss")
+
 
         G_loss = 0.0
         for loss_name,loss in zip(g_loss_name_list,g_loss_list):
@@ -131,30 +165,32 @@ class GAN_trainer(BaseModel):
             self.real_imgs.requires_grad = True
 
         dis_real, self.real_d_feats = self.D_Net(self.real_imgs)
+
         dis_fake, _ = self.D_Net(self.fake_imgs.detach())
-        dis_loss,r1_loss = Dis_loss(dis_real, dis_fake, real_bt=self.real_imgs,
-                                 type=self.opt.gan_loss_type,lambda_r1=self.opt.lambda_r1)
+        if self.mode == 3:
+            dis_loss, r1_loss = Dis_loss_mask(dis_real, dis_fake, (1 - self.mask), real_bt=self.real_imgs,
+                                              type=self.opt.gan_loss_type, lambda_r1=self.opt.lambda_r1)
+        else:
+            dis_loss, r1_loss = Dis_loss(dis_real, dis_fake, real_bt=self.real_imgs,
+                                         type=self.opt.gan_loss_type, lambda_r1=self.opt.lambda_r1)
+
 
         self.lossDict['dis_loss'] = dis_loss.item()
         self.lossDict['r1_loss'] = r1_loss.item()
 
         self.accelerator.backward(dis_loss)
 
+
     def optimize_params(self):
         if self.opt.use_gan_loss:
             with self.accelerator.accumulate(self.D_Net):
-                self.D_opt.zero_grad()
+                self.D_opt.zero_grad(set_to_none=True)
                 self.backward_D()
                 self.D_opt.step()
 
         with self.accelerator.accumulate(self.G_Net):
-            self.G_opt.zero_grad()
+            self.G_opt.zero_grad(set_to_none=True)
             self.backward_G()
-            if self.opt.use_grad_norm:
-                # gradient clip
-                self.accelerator.clip_grad_norm_(parameters=self.G_Net.parameters(),
-                                            max_norm=self.opt.max_grad_norm,
-                                            norm_type=self.opt.grad_norm_type)
             self.G_opt.step()
             if self.opt.enable_ema:
                 self.ema_G.update(self.G_Net.parameters())
@@ -176,26 +212,47 @@ class GAN_trainer(BaseModel):
 
     @torch.no_grad()
     def validate(self,batch,count):
-        self.val_count = count
         unwrap_model = self.accelerator.unwrap_model(self.G_Net)
-        unwrap_model = unwrap_model.to(self.device)
-        fake_imgs = unwrap_model.gan_forward(batch)
-        real_imgs,_ = self.teacher.sample(batch)
+        self.val_count = count
+        if self.mode == 3:
+            real_imgs, masks = batch
+            noise = torch.randn(real_imgs.size(0),self.teacher.model.style_dim).to(self.device)
+        else:
+            masks, noise = batch
+            true_latent = self.teacher.model.get_latent(noise)
+            true_latents = true_latent.unsqueeze(1).repeat(1, self.G_Net.latent_num, 1)
+            real_imgs = self.make_sample(latents=true_latents)
+
+        fake_latents, *_ = unwrap_model.get_latent(real_imgs, masks, noise)
+        if self.mode == 1:
+            fake_imgs = self.make_sample(latents=fake_latents)
+        elif self.mode == 2:
+            fake_imgs = unwrap_model.generator(fake_latents)
+        else:
+            # fake_imgs = unwrap_model.generator(fake_latents)
+            gan_fake_imgs = self.make_sample(latents=fake_latents)
+            merged_x = real_imgs * masks + gan_fake_imgs * (1 - masks)
+            fake_imgs = unwrap_model.refine(merged_x)
+            if self.opt.record_val_imgs and self.opt.debug:
+                self.val_im_dict['merged_x'] = self.postprocess(merged_x).cpu().detach()
+
         fake_imgs = self.postprocess(fake_imgs)
         real_imgs = self.postprocess(real_imgs)
+        masked_imgs = real_imgs * masks
 
         if self.opt.record_val_imgs:
-            self.val_im_dict['fake_imgs'] = fake_imgs.cpu().detach()
             self.val_im_dict['real_imgs'] = real_imgs.cpu().detach()
+            self.val_im_dict['fake_imgs'] = fake_imgs.cpu().detach()
+            self.val_im_dict['masked_imgs'] = masked_imgs.cpu().detach()
 
         self.logging()
 
-        return tensor2cv(real_imgs),tensor2cv(fake_imgs)
+        return tensor2cv(real_imgs),tensor2cv(fake_imgs),tensor2cv(masked_imgs)
 
     def get_current_imgs(self):
-        if self.mode == 1:
-            self.im_dict['real_imgs'] = self.real_imgs.cpu().detach()
-            self.im_dict['fake_imgs'] = self.fake_imgs.cpu().detach()
+        self.im_dict['real_imgs'] = self.real_imgs.cpu().detach()
+        self.im_dict['masked_imgs'] = (self.real_imgs * self.mask).cpu().detach()
+        self.im_dict['fake_imgs'] = self.fake_imgs.cpu().detach()
 
     def logging(self):
         for lossName, lossValue in self.lossDict.items():
@@ -233,22 +290,30 @@ class GAN_trainer(BaseModel):
 
 
     #save validate imgs
-    def save_results(self,val_real_ims,val_fake_ims):
+    def save_results(self,val_real_ims,val_fake_ims,val_masked_ims=None):
         im_index = 0
         val_save_dir = os.path.join(self.val_saveDir, 'val_results')
         if os.path.exists((val_save_dir)):
             shutil.rmtree(val_save_dir)
         checkDir([val_save_dir])
-        if self.mode == 1:
-            for real_im, fake_im in zip(val_real_ims, val_fake_ims):
-                Image.fromarray(real_im).save(val_save_dir + '/{:0>5d}_im_truth.jpg'.format(im_index))
-                Image.fromarray(fake_im).save(val_save_dir + '/{:0>5d}_im_out.jpg'.format(im_index))
-                im_index += 1
+        for real_im, comp_im, masked_im in zip(val_real_ims, val_fake_ims, val_masked_ims):
+            Image.fromarray(real_im).save(val_save_dir + '/{:0>5d}_im_truth.jpg'.format(im_index))
+            Image.fromarray(comp_im).save(val_save_dir + '/{:0>5d}_im_out.jpg'.format(im_index))
+            Image.fromarray(masked_im).save(val_save_dir + '/{:0>5d}_im_masked.jpg'.format(im_index))
+            im_index += 1
+
+    def load_from(self,model_path):
+        model_state_dict = torch.load(model_path)
+        new_state_dict = OrderedDict(
+            {k.replace("generator.", ""): v for k, v in model_state_dict.items() if k.startswith("generator")})
+        new_state_dict_ = OrderedDict(
+            {k.replace("mapping_net.", ""): v for k, v in model_state_dict.items() if k.startswith("mapping_net")})
+        self.G_Net.generator.load_state_dict(new_state_dict)
+        self.G_Net.mapping_net.load_state_dict(new_state_dict_)
 
     def load(self):
-        if self.mode == 1:
-            self.load_network(self.saveDir, self.G_Net, load_last=self.opt.load_last,load_from_iter=self.opt.load_from_iter)
-            self.load_network(self.saveDir + '/latest_dis.pth', self.D_Net, load_last=self.opt.load_last)
+        self.load_network(self.saveDir, self.G_Net, load_last=self.opt.load_last,load_from_iter=self.opt.load_from_iter)
+        self.load_network(self.saveDir + '/latest_dis.pth', self.D_Net, load_last=self.opt.load_last)
 
     # save checkpoint
     def save_network(self,loss_mean_val,val_type='default'):
@@ -258,16 +323,19 @@ class GAN_trainer(BaseModel):
         save_path = os.path.join(self.saveDir,
                 "G-step={}_lr={}_{}_loss={}.pth".format(self.count+1, round(self.current_lr,6), val_type,loss_mean_val))
         dis_save_path = os.path.join(self.saveDir, 'latest_dis.pth')
+        dis_latent_save_path = os.path.join(self.saveDir, 'latest_latent_dis.pth')
 
         self.accelerator.print('saving network...')
 
 
         #work for ditributed training
         # if self.opt.acc_save:
-        if self.mode  == 1:
-            os.rename(src_save_path,save_path)
-            unwrap_model = self.accelerator.unwrap_model(self.D_Net)
-            self.accelerator.save(unwrap_model.state_dict(), dis_save_path)
+        os.rename(src_save_path,save_path)
+        unwrap_model = self.accelerator.unwrap_model(self.D_Net)
+        self.accelerator.save(unwrap_model.state_dict(), dis_save_path)
+
+        # unwrap_model = self.accelerator.unwrap_model(self.latent_D_Net)
+        # self.accelerator.save(unwrap_model.state_dict(), dis_latent_save_path)
 
         self.accelerator.print('saving network done. ')
 
@@ -281,22 +349,10 @@ class GAN_trainer(BaseModel):
     def postprocess(self, x):
         return (x + 1.0) * 0.5
 
-    def requires_grad(self,model, flag=True):
-        for p in model.parameters():
-            p.requires_grad = flag
 
-    def img_to_dwt(self, img):
-        low, high = self.dwt(img)
-        b, _, _, h, w = high[0].size()
-        high = high[0].view(b, -1, h, w)
-        freq = torch.cat([low, high], dim=1)
-        return freq
 
-    def dwt_to_img(self, img):
-        b, c, h, w = img.size()
-        low = img[:, :3, :, :]
-        high = img[:, 3:, :, :].view(b, 3, 3, h, w)
-        return self.idwt((low, [high]))
+
+
 
 
 

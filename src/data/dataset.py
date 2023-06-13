@@ -3,6 +3,7 @@ import math
 from torch.utils import data
 import random
 import numpy as np
+import torch
 import torchvision.transforms.functional as F
 import torchvision.transforms as transform
 import cv2
@@ -253,6 +254,162 @@ class Dataset(data.Dataset):
                     all_file.append(t)
 
         return all_file
+
+class MaskDataset(data.Dataset):
+    def __init__(self, target_size, batch_size, n_batch, training = True, mask_reverse=True, center_crop=False, data_type='resize', min_mask_ratio=5, max_mask_ratio=70,
+                rect_size=64,seed=2023,mask_type = "default",latent_nc = 512,
+                 get_seg_mask=False):
+        super(MaskDataset, self).__init__()
+        self.center_crop = center_crop
+        self.latent_nc = 512
+        self.training = training
+        self.batch_size = batch_size
+        self.n_batch = n_batch
+
+        if get_seg_mask:
+            self.seg_mask_generator = RandomSegmentationMaskGenerator()
+            # self.seg_mask_generator = MySegMaskGen()
+        else:
+            self.seg_mask_generator = None
+
+        self.mask_seed = seed
+        self.mask_generator = RandomMask(s=target_size,hole_range=[min_mask_ratio/100,max_mask_ratio/100])
+        self.lama_mask_gen = get_mask_generator(kind=mask_type)
+        self.rect_size = rect_size
+        self.data_type = data_type
+        self.target_size = target_size
+        self.mask_reverse = mask_reverse
+        self.min_mask_ratio = min_mask_ratio
+        self.max_mask_ratio = max_mask_ratio
+        # if self.augment:
+        #     self.img_augment = A.Compose([
+        #         A.HorizontalFlip(),
+        #         A.OpticalDistortion(),
+        #         A.CLAHE()])
+
+        # for external mask only
+        self.mask_transform = transform.Compose([
+            transform.RandomVerticalFlip(0.5),
+            transform.RandomHorizontalFlip(0.5),
+            transform.Resize(self.target_size),
+        ])
+
+        # in test mode, there's a one-to-one relationship between mask and image
+        # masks are loaded non random
+
+    def __len__(self):
+        return self.batch_size * self.n_batch
+
+    def __getitem__(self, index):
+        noise = torch.randn(self.latent_nc)
+        mask = self.load_mask(index, mask_type=1)
+        mask = self.to_tensor(mask)
+        return mask, noise
+
+    def load_mask(self, index,mask_type,img=None):
+        # external mask, random order
+        if mask_type == 0:
+            mask_index = random.randint(0, len(self.mask_data) - 1)
+            mask = imread(self.mask_data[mask_index])
+            mask = self.resize(mask, False)
+            mask = (mask > 0).astype(np.uint8)  # threshold due to interpolation
+            mask = np.expand_dims(mask, axis=2)
+            mask = np.concatenate([mask, mask, mask], axis=2)
+            if self.mask_reverse:
+                return (1 - mask) * 255
+            else:
+                return mask * 255
+
+        # generate random mask
+        if mask_type == 1:
+            mask = get_random_mask(im_size=self.target_size,mask_size=self.rect_size,seed=self.mask_seed,img = img,
+                                   mask_gen=self.mask_generator,seg_mask_gen=self.seg_mask_generator,lama_mask_gen=self.lama_mask_gen,
+                                   target_size=self.target_size)
+            # mask = self.resize(mask, False)
+            mask = (mask > 0).astype(np.uint8)
+            if self.mask_reverse:
+                return (1 - mask) * 255
+            else:
+                return mask * 255
+
+        # generate random square mask
+        if mask_type == 2:
+            if self.training:
+                mask, _ = generate_rect_mask(self.target_size, self.rect_size)
+            else:
+                mask, _ = generate_rect_mask(self.target_size, self.rect_size, rand_mask=False)  # central square for testing mode
+
+            mask = (mask > 0).astype(np.uint8)
+
+            if self.mask_reverse:
+                return (1 - mask) * 255
+            else:
+                return mask * 255
+
+        # external mask, fixed order
+        if mask_type == 3:
+            mask_index = index
+            mask = imread(self.mask_data[mask_index])
+            mask = self.resize(mask, False)
+            mask = (mask > 0).astype(np.uint8)  # threshold due to interpolation
+            if len(mask.shape) == 2:
+                mask = np.expand_dims(mask, axis=2)
+                mask = np.concatenate([mask, mask, mask], axis=2)
+
+            if self.mask_reverse:
+                return (1 - mask) * 255
+            else:
+                return mask * 255
+
+    def resize(self, img, aspect_ratio_kept=True, fixed_size=False, centerCrop=False):
+
+        if aspect_ratio_kept:
+            imgh, imgw = img.shape[0:2]
+            side = np.minimum(imgh, imgw)
+            if fixed_size:
+                if centerCrop:
+                    # center crop
+                    j = (imgh - side) // 2
+                    i = (imgw - side) // 2
+                    img = img[j:j + side, i:i + side, ...]
+                else:
+                    j = (imgh - side)
+                    i = (imgw - side)
+                    h_start = 0
+                    w_start = 0
+                    if j != 0:
+                        h_start = random.randrange(0, j)
+                    if i != 0:
+                        w_start = random.randrange(0, i)
+                    img = img[h_start:h_start + side, w_start:w_start + side, ...]
+            else:
+                if side <= self.target_size:
+                    j = (imgh - side)
+                    i = (imgw - side)
+                    h_start = 0
+                    w_start = 0
+                    if j != 0:
+                        h_start = random.randrange(0, j)
+                    if i != 0:
+                        w_start = random.randrange(0, i)
+                    img = img[h_start:h_start + side, w_start:w_start + side, ...]
+                else:
+                    side = random.randrange(self.target_size, side)
+                    j = (imgh - side)
+                    i = (imgw - side)
+                    h_start = random.randrange(0, j)
+                    w_start = random.randrange(0, i)
+                    img = img[h_start:h_start + side, w_start:w_start + side, ...]
+        img = np.array(Image.fromarray(img).resize(size=(self.target_size, self.target_size)))
+        return img
+
+    def to_tensor(self, img, toRGB=False):
+        img = Image.fromarray(img)
+        if toRGB:
+            img = img.convert('RGB')
+        img_t = F.to_tensor(img).float()      #normalize to 0 ~ 1
+        return img_t
+
 
 def get_random_mask(im_size,mask_size=64,seed=2022,img = None,mask_gen=None,seg_mask_gen=None,lama_mask_gen=None,
                     target_size=256):

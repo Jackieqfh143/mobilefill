@@ -3,7 +3,9 @@ from omegaconf import OmegaConf
 from src.evaluate.evaluation import validate
 from src.utils.util import backup_src_code
 from prefetch_generator import BackgroundGenerator
-from src.gan_trainer import GAN_trainer as InpaintingModel
+# from src.gan_trainer import GAN_trainer as InpaintingModel
+from src.data.dataset import MaskDataset, Dataset
+from src.gan_trainer import EncoderTrainer as InpaintingModel
 from complexity import print_network_params
 from tqdm import tqdm
 import random
@@ -14,19 +16,6 @@ import argparse
 import torch
 import time
 import os
-
-class NoiseDataset(torch.utils.data.Dataset):
-    def __init__(self, latent_nc, batch_size, n_batches):
-        self.latent_nc = latent_nc
-        self.batch_size = batch_size
-        self.n_batches = n_batches
-
-    def __len__(self):
-        return self.batch_size * self.n_batches
-
-    def __getitem__(self, idx):
-        noise = torch.randn(self.latent_nc)
-        return noise
 
 class DataLoaderX(DataLoader):
     def __iter__(self):
@@ -78,9 +67,16 @@ with open(inpaintingModel.saveDir+'/configs.yaml','w') as fp:
     OmegaConf.save(config=opt,f=fp.name)
 
 
-train_dataset = NoiseDataset(latent_nc = 512, batch_size = opt.batchSize, n_batches = 10000)
+train_dataset = MaskDataset(target_size=opt.targetSize, latent_nc = 512, batch_size = opt.batchSize, n_batch = 10000)
 
-val_dataset = NoiseDataset(latent_nc = 512, batch_size = 20, n_batches = 1000)
+if opt.mode == 3:
+    val_dataset = Dataset(opt.val_dataDir, opt.val_maskDir, opt.val_maskType, opt.targetSize,
+                          center_crop=opt.center_crop,
+                          training=False)
+else:
+    val_dataset = MaskDataset(target_size=opt.targetSize, latent_nc = 512, batch_size = 20, n_batch = 1000)
+
+
 # get dataloader
 train_dataloader = DataLoaderX(train_dataset,
                         batch_size=opt.batchSize, shuffle=True, drop_last=False,num_workers=opt.num_workers,
@@ -151,21 +147,24 @@ def validation(val_type='default',enable_ema=False):
     if accelerator.is_main_process:
         all_val_real_ims = []
         all_val_fake_ims = []
+        all_val_masked_ims = []
+
         val_count = 0
         for batch in tqdm(val_dataloader):
             for i, im in enumerate(batch):
                 im = im.to(inpaintingModel.device)
                 batch[i] = im
-            val_real_ims, val_fake_ims = inpaintingModel.validate(batch, val_count)
+            val_real_ims, val_fake_ims,val_masked_ims = inpaintingModel.validate(batch, val_count)
 
             all_val_real_ims += val_real_ims
             all_val_fake_ims += val_fake_ims
+            all_val_masked_ims += val_masked_ims
             val_count += 1
             if val_count % opt.max_val_batches == 0:
                 break
 
         # save validate results
-        inpaintingModel.save_results(all_val_real_ims, all_val_fake_ims)
+        inpaintingModel.save_results(all_val_real_ims, all_val_fake_ims, all_val_masked_ims)
         val_save_dir = os.path.join(inpaintingModel.val_saveDir, 'val_results')
         val_loss_dict, loss_mean_val, metric_messgae = validate(real_imgs_dir=val_save_dir,
                                                                 comp_imgs_dir=val_save_dir,

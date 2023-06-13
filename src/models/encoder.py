@@ -1,10 +1,12 @@
 import random
 
+import numpy as np
 import torch
 from torch.nn import init
 from src.modules.cnn_utils import *
 from src.modules.ffc import *
 import math
+from src.models.mapping_network import MappingNetwork
 from src.modules.legacy import EqualLinear
 from src.models.discriminator import Self_Attn, AttentionModule
 from src.modules.attention import SEAttention, CrissCrossAttention, ECAAttention
@@ -584,6 +586,29 @@ class ToStyle_v2(nn.Module):
         x = self.pool(x)
         x = self.fc(x.flatten(start_dim=1))
 
+        return x
+
+class MiniToStyle(nn.Module):
+    def __init__(self, in_channels, out_channels, activation='leaky'):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels = in_channels, out_channels = in_channels // 4, kernel_size=1),
+            MyConv2d(in_channels=in_channels // 4, out_channels=in_channels // 4, kernel_size=3, stride=2, padding=1,
+                     activation=activation),
+            MyConv2d(in_channels=in_channels // 4, out_channels=in_channels // 4, kernel_size=3, stride=2, padding=1,
+                     activation=activation),
+            MyConv2d(in_channels=in_channels // 4, out_channels=in_channels // 4, kernel_size=3, stride=2, padding=1,
+                     activation=activation),
+            nn.Conv2d(in_channels=in_channels // 4, out_channels=in_channels, kernel_size=1),
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = EqualLinear(in_channels, out_channels, activation='fused_lrelu')
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.pool(x)
+        x = self.fc(x.flatten(start_dim=1))
         return x
 
 
@@ -1724,7 +1749,6 @@ class EESPNet_v18(nn.Module):
     #     else:
     #         return random.random()
 
-
 class EESPNet_v19(nn.Module):
     '''
     This class defines the ESPNetv4 architecture for encoder
@@ -1840,7 +1864,6 @@ class EESPNet_v19(nn.Module):
     #         return 0.5 * random.random()
     #     else:
     #         return random.random()
-
 
 class EESPNet_v20(nn.Module):
     '''
@@ -2056,6 +2079,293 @@ class EESPNet_v21(nn.Module):
 
         return gs, feats
 
+class EESPNet_v22(nn.Module):
+    '''
+    This class defines the ESPNetv4 architecture for encoder
+    '''
+
+    def __init__(self, config, input_nc=4, output_nc=512, input_size=256, latent_nc=512, down_num=4, mask_ratio=0.5):
+        '''
+        :param s: factor that scales the number of output feature maps
+        '''
+        super().__init__()
+        self.mask_ratio = mask_ratio
+        self.level1_0 = CBR(input_nc, config[0], 3, 2)  # 112 L1
+
+        self.level1 = nn.ModuleList()
+        for i in range(3):
+            self.level1.append(EESP_V4(config[0], config[0], stride=1, d_rates=[1, 2, 4]))
+
+        self.level2_0 = DownSampler(config[0], config[1], k=4, r_lim=13)  # out = 56
+
+        self.level2 = nn.ModuleList()
+        for i in range(3):
+            self.level2.append(EESP_V4(config[1], config[1], stride=1, d_rates=[1, 2, 4]))
+
+        self.level3_0 = DownSampler(config[1], config[2], k=4, r_lim=13)  # out = 28
+        self.level3 = nn.ModuleList()
+        for i in range(3):
+            self.level3.append(EESP_V4(config[2], config[2], stride=1, d_rates=[1, 2, 4]))
+
+        self.level4_0 = DownSampler(config[2], config[3], k=4, r_lim=13)  # out = 14
+
+        self.img_size = input_size // 2 ** down_num
+        self.transformer = MobileViT_V3(in_channels=config[3], image_size=(self.img_size, self.img_size))
+        self.to_style = ToStyle(config[3], latent_nc)
+        self.to_square = EqualLinear(latent_nc, self.img_size * self.img_size, activation="fused_lrelu")
+        self.init_params()
+
+    def init_params(self):
+        '''
+        Function to initialze the parameters
+        '''
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, input, ws):
+        '''
+        :param input: Receives the input RGB image
+        :return: a C-dimensional vector, C=# of classes
+        '''
+
+        feats = []
+        out_l1_0 = self.level1_0(input)  # 112
+        for i, layer in enumerate(self.level1):
+            if i == 0:
+                out_l1 = layer(out_l1_0)
+            else:
+                out_l1 = layer(out_l1)
+
+        feats.append(out_l1)
+
+        out_l2_0 = self.level2_0(out_l1)  # 56
+        for i, layer in enumerate(self.level2):
+            if i == 0:
+                out_l2 = layer(out_l2_0)
+            else:
+                out_l2 = layer(out_l2)
+
+        feats.append(out_l2)
+        out_l3_0 = self.level3_0(out_l2)  # down-sample
+        for i, layer in enumerate(self.level3):
+            if i == 0:
+                out_l3 = layer(out_l3_0)
+            else:
+                out_l3 = layer(out_l3)
+
+        feats.append(out_l3)
+
+        out_l4_0 = self.level4_0(out_l3)  # down-sample
+
+        # mask_ratio = random.random() if self.training else self.mask_ratio
+        mask = rand_cutout(out_l4_0, self.mask_ratio)
+        add_n = self.to_square(ws).view(-1, self.img_size, self.img_size).unsqueeze(1)
+        add_n = F.interpolate(add_n, size=out_l4_0.size()[-2:], mode='bilinear', align_corners=False)
+        out_x = out_l4_0 * mask + add_n * (1 - mask)
+
+        out_x = self.transformer(out_x)
+        feats.append(out_x)
+        feats = feats[::-1]
+        gs = self.to_style(out_x)
+
+        return gs, feats
+
+    # def get_mask_ratio(self):
+    #     if self.training:
+    #         return 0.5 * random.random()
+    #     else:
+    #         return random.random()
+
+class StyleEncoder(nn.Module):
+    '''
+    This class defines the ESPNetv4 architecture for encoder
+    '''
+
+    def __init__(self, config, input_nc=4,  input_size=256, latent_nc=512, down_num=4, mask_ratio=0.5):
+        '''
+        :param s: factor that scales the number of output feature maps
+        '''
+        super().__init__()
+        self.mask_ratio = mask_ratio
+        self.level1_0 = CBR(input_nc, config[0], 3, 2)  # 112 L1
+        self.log_size = int(math.log(input_size, 2))
+        self.n_latent = self.log_size * 2
+
+        self.level1 = nn.ModuleList()
+        for i in range(3):
+            self.level1.append(EESP_V4(config[0], config[0], stride=1, d_rates=[1, 2, 4]))
+
+        self.level2_0 = DownSampler(config[0], config[1], k=4, r_lim=13)  # out = 56
+
+        self.level2 = nn.ModuleList()
+        for i in range(3):
+            self.level2.append(EESP_V4(config[1], config[1], stride=1, d_rates=[1, 2, 4]))
+
+        self.level3_0 = DownSampler(config[1], config[2], k=4, r_lim=13)  # out = 28
+        self.level3 = nn.ModuleList()
+        for i in range(3):
+            self.level3.append(EESP_V4(config[2], config[2], stride=1, d_rates=[1, 2, 4]))
+
+        self.level4_0 = DownSampler(config[2], config[3], k=4, r_lim=13)  # out = 14
+
+        self.img_size = input_size // 2 ** down_num
+        self.latent_mlp = MappingNetwork(style_dim=latent_nc,n_layers=8)
+        self.transformer = MobileViT_V3(in_channels=config[3], image_size=(self.img_size, self.img_size))
+        self.style_module = nn.ModuleList()
+        for i in range(down_num):
+            self.style_module.append(MiniToStyle(config[i], latent_nc))
+        self.to_square = EqualLinear(latent_nc, self.img_size * self.img_size, activation="fused_lrelu")
+        self.init_params()
+
+    def init_params(self):
+        '''
+        Function to initialze the parameters
+        '''
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, input, noise):
+        '''
+        :param input: Receives the input RGB image
+        :return: a C-dimensional vector, C=# of classes
+        '''
+
+        feats = []
+        deltas = []
+        out_l1_0 = self.level1_0(input)  # 112
+        for i, layer in enumerate(self.level1):
+            if i == 0:
+                out_l1 = layer(out_l1_0)
+            else:
+                out_l1 = layer(out_l1)
+
+        feats.append(out_l1)
+        delta1 = self.style_module[0](out_l1)
+        delta1 = delta1.unsqueeze(1).repeat(1, 4, 1)
+        deltas.append(delta1)
+
+        out_l2_0 = self.level2_0(out_l1)  # 56
+        for i, layer in enumerate(self.level2):
+            if i == 0:
+                out_l2 = layer(out_l2_0)
+            else:
+                out_l2 = layer(out_l2)
+
+        feats.append(out_l2)
+        delta2 = self.style_module[1](out_l2)
+        delta2 = delta2.unsqueeze(1).repeat(1, 2, 1)
+        deltas.append(delta2)
+
+        out_l3_0 = self.level3_0(out_l2)  # down-sample
+        for i, layer in enumerate(self.level3):
+            if i == 0:
+                out_l3 = layer(out_l3_0)
+            else:
+                out_l3 = layer(out_l3)
+
+        feats.append(out_l3)
+        delta3 = self.style_module[2](out_l3)
+        delta3 = delta3.unsqueeze(1).repeat(1, 2, 1)
+        deltas.append(delta3)
+
+        out_l4_0 = self.level4_0(out_l3)  # down-sample
+
+        ws = self.latent_mlp(noise)
+        mask = rand_cutout(out_l4_0, self.mask_ratio)
+        add_n = self.to_square(ws).view(-1, self.img_size, self.img_size).unsqueeze(1)
+        add_n = F.interpolate(add_n, size=out_l4_0.size()[-2:], mode='bilinear', align_corners=False)
+        out_x = out_l4_0 * mask + add_n * (1 - mask)
+
+        out_x = self.transformer(out_x)
+        feats.append(out_x)
+        feats = feats[::-1]
+        gs = self.style_module[3](out_x)
+        gs = gs.unsqueeze(1).repeat(1, self.n_latent, 1)
+        init_idx = 2 * int(math.log(out_x.shape[-1],2))
+        deltas = deltas[::-1]
+        deltas = torch.cat(deltas,dim = 1)
+        gs[:,init_idx:] += deltas
+        return gs, deltas, feats
+
+class RefineEncoder(nn.Module):
+    def __init__(self, config = [64, 64, 128, 256, 512], input_nc=4, input_size=256, down_num=4):
+        super().__init__()
+        self.in_affine = CBR(input_nc, config[0], 3, 1)
+        self.blocks = nn.ModuleList()
+        for i in range(0, down_num):
+            idx = min(len(config) - 1, i + 1)
+            use_eesp = True if idx < len(config) - 1 else False
+            self.blocks.append(EncoderBlock(in_dim = config[i], out_dim = config[idx], use_eesp = use_eesp))
+
+        self.img_size = input_size // 2 ** down_num
+        self.init_params()
+
+    def init_params(self):
+        '''
+        Function to initialze the parameters
+        '''
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, input):
+        feats = []
+        hidden = self.in_affine(input)
+        for i, module in enumerate(self.blocks):
+            hidden = module(hidden)
+            feats.append(hidden)
+        feats = feats[::-1]
+        return feats[0], feats
+
+class EncoderBlock(nn.Module):
+    def __init__(self,in_dim, out_dim, use_eesp = True):
+        super(EncoderBlock, self).__init__()
+        self.down_block = DownSampler(in_dim, out_dim, k=4, r_lim=13)
+
+        self.use_eesp = use_eesp
+
+        self.layers = nn.ModuleList()
+        for i in range(3):
+            self.layers.append(EESP_V4(out_dim, out_dim, stride=1, d_rates=[1, 2, 4]))
+
+    def forward(self, x):
+        x = self.down_block(x)
+        if not self.use_eesp:
+            return x
+
+        for i, module in enumerate(self.layers):
+            x = module(x)
+            return x
+
 
 if __name__ == '__main__':
     from complexity import *
@@ -2073,14 +2383,25 @@ if __name__ == '__main__':
     input = torch.Tensor(1, 4, 256, 256)
     ws = torch.randn(1, 512)
     style_square = torch.randn(1, 512, 16, 16)
-    en_channels = [v for k, v in channels.items() if k < input.size(-1)][::-1]
+    # en_channels = [v for k, v in channels.items() if k < input.size(-1)][::-1]
+
+    en_channels = [128, 256, 256, 512]
     # model = EESPNet_v2(input_nc=4,output_nc=512,input_size=256)
-    model = EESPNet_v21(config=en_channels, input_nc=4, input_size=256)
+    # model = EESPNet_v22(config=en_channels, input_nc=4, input_size=256)
+
+    model = StyleEncoder(config = en_channels, input_nc=4, input_size=256)
     # model = LFFC_encoder(input_nc=4,latent_nc=512,n_downsampling=4,ngf=64)
     # summary(model,(4,256,256))
     print_network_params(model, "model")
     # print_network_params(model.out_affine,"out_affine")
-    # flop_counter(model,(input,ws))
-    out = model(input)
+    flop_counter(model,(input,ws))
+    out = model(input, ws)
+
+    en_channels = [64, 64, 128, 256, 512]
+    model = RefineEncoder(config=en_channels, input_nc=4, input_size=256)
+    print_network_params(model, "model")
+    flop_counter(model, (input, ))
+    refine_en_out = model(input)
+
     # print('Output size')
     # print(out.size())
