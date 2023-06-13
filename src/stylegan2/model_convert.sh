@@ -1,0 +1,2 @@
+export PYTHONPATH=$(dirname $(dirname "$PWD"))
+python convert_weight.py --repo /home/codeoops/CV/InPainting/stylegan2-tensorflow /home/codeoops/CV/InPainting/stylegan2-tensorflow/checkpoints/stylegan2-church-config-f.pkl

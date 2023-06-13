@@ -1,0 +1,1 @@
+python fid.py --n_sample 10000 --inception ./inception/inception_v3_features.pkl ./checkpoint/210000.pt
